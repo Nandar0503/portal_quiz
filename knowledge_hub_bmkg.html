@@ -6,7 +6,10 @@
 <title>CC Knowledge Hub</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script><style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore-compat.js"></script><style>
 /* ============ DESIGN TOKENS ============ */
 :root{
   --navy-950:#0a1628; --navy-900:#0f1e35; --navy-800:#132747; --navy-700:#1b3358;
@@ -1294,8 +1297,8 @@ function renderPortalLoginForm(role){
     <div class="portal-header"><div class="ic">${r.icon}</div><div><b>${r.label} Portal</b><span>Login khusus akun ${r.label}</span></div></div>
 
     <div class="field">
-      <label>Username / Agent ID</label>
-      <input type="text" id="login-username" placeholder="Masukkan username ${r.label} Anda" autocomplete="username">
+      <label>Email Firebase</label>
+      <input type="email" id="login-username" placeholder="Masukkan email ${r.label} Anda" autocomplete="username">
     </div>
     <div class="field">
       <label>Password</label>
@@ -1303,12 +1306,12 @@ function renderPortalLoginForm(role){
     </div>
     <div class="row-between">
       <label><input type="checkbox" id="remember-me" checked style="width:auto;"> Remember me</label>
-      <a href="#" onclick="showToast('Silakan hubungi Super Admin untuk reset password.','info');return false;" style="color:var(--blue-600); font-weight:600;">Forgot password?</a>
+      <a href="#" onclick="firebaseResetPassword();return false;" style="color:var(--blue-600); font-weight:600;">Forgot password?</a>
     </div>
     <button class="btn btn-primary btn-block" onclick="handleLogin()">Login sebagai ${r.label}</button>
     <div id="login-error" class="small-muted" style="color:var(--red-600); margin-top:10px; display:none;"></div>
 
-    <button type="button" class="cred-reveal-toggle" onclick="toggleCredReveal('${role}')">🔒 <span id="cred-reveal-label">Tampilkan akun demo untuk portal ini</span></button>
+    <button type="button" class="cred-reveal-toggle" onclick="toggleCredReveal('${role}')">🔒 <span id="cred-reveal-label">Gunakan akun Firebase Authentication</span></button>
     <div id="cred-reveal-panel" class="cred-reveal-panel hidden"></div>
   `;
   const uEl = document.getElementById('login-username'), pEl = document.getElementById('login-password');
@@ -1329,7 +1332,7 @@ function toggleCredReveal(role){
   } else {
     panel.classList.add('hidden');
     panel.innerHTML='';
-    label.textContent = 'Tampilkan akun demo untuk portal ini';
+    label.textContent = 'Gunakan akun Firebase Authentication';
   }
 }
 function quickLogin(userId){
@@ -3324,6 +3327,178 @@ function initApp(){
   window.addEventListener('resize', ()=>{ if(window.innerWidth>900) document.getElementById('sidebar').classList.remove('open'); });
 }
 if(document.readyState==='loading'){ document.addEventListener('DOMContentLoaded', initApp); } else { initApp(); }
+
+
+
+async function firebaseResetPassword(){
+  const email=document.getElementById('login-username')?.value.trim();
+  if(!email || !email.includes('@')){ showToast('Masukkan email Firebase terlebih dahulu.','info'); return; }
+  try{ await FB_AUTH.sendPasswordResetEmail(email); showToast('Link reset password dikirim ke email Anda.','success'); }
+  catch(e){ showToast(e.message||'Gagal mengirim reset password.','error'); }
+}
+
+/* ===================== FIREBASE AUTH + FIRESTORE BRIDGE ===================== */
+const FIREBASE_CONFIG = {
+  apiKey: "AIzaSyCxfihERKrrstKATKhgojGIc8TxIYNzMSc",
+  authDomain: "knowledge-hub-bmkg.firebaseapp.com",
+  projectId: "knowledge-hub-bmkg",
+  storageBucket: "knowledge-hub-bmkg.firebasestorage.app",
+  messagingSenderId: "870846097952",
+  appId: "1:870846097952:web:90c94b2c34c459109eea45",
+  measurementId: "G-BL3K8NJWDS"
+};
+let FB_APP=null, FB_AUTH=null, FB_DB=null;
+try {
+  FB_APP = firebase.apps.length ? firebase.app() : firebase.initializeApp(FIREBASE_CONFIG);
+  FB_AUTH = firebase.auth();
+  FB_DB = firebase.firestore();
+  window.__firebaseReady = true;
+  console.info('[Firebase] Connected:', FIREBASE_CONFIG.projectId);
+} catch(err) {
+  window.__firebaseReady = false;
+  console.error('[Firebase] Initialization failed:', err);
+}
+
+async function fbGetUserProfile(uid){
+  if(!FB_DB) return null;
+  const snap = await FB_DB.collection('users').doc(uid).get();
+  return snap.exists ? {id:snap.id, ...snap.data()} : null;
+}
+async function fbSaveUserProfile(uid, data){
+  if(!FB_DB) return;
+  await FB_DB.collection('users').doc(uid).set({...data, updatedAt:firebase.firestore.FieldValue.serverTimestamp()},{merge:true});
+}
+async function fbSaveAttempt(attempt){
+  if(!FB_DB || !attempt) return;
+  const ref = FB_DB.collection('attempts').doc(String(attempt.id));
+  await ref.set({...attempt, firebaseUid: FB_AUTH.currentUser?.uid || null, createdAt:firebase.firestore.FieldValue.serverTimestamp()},{merge:true});
+}
+async function fbSaveAudit(activity, detail){
+  if(!FB_DB) return;
+  const u=state.currentUser;
+  await FB_DB.collection('auditLog').add({
+    activity, detail:detail||'', userId:u?.id||FB_AUTH.currentUser?.uid||null,
+    user:u?.name||FB_AUTH.currentUser?.email||'System', role:u?.role||'-',
+    session:state.sessionId||'-', ts:new Date().toISOString(),
+    createdAt:firebase.firestore.FieldValue.serverTimestamp()
+  });
+}
+async function fbLoadMyAttempts(uid){
+  if(!FB_DB) return;
+  try {
+    const snap=await FB_DB.collection('attempts').where('firebaseUid','==',uid).limit(100).get();
+    const remote=snap.docs.map(d=>({id:d.id,...d.data()}));
+    remote.forEach(a=>{
+      const i=DB.attempts.findIndex(x=>String(x.id)===String(a.id));
+      if(i>=0) DB.attempts[i]=a; else DB.attempts.push(a);
+    });
+  } catch(e){ console.warn('[Firebase] attempts load skipped:',e.message); }
+}
+
+/* Replace demo credential validation with Firebase Authentication. */
+handleLogin = async function(){
+  const email = document.getElementById('login-username')?.value.trim();
+  const pass = document.getElementById('login-password')?.value || '';
+  const errEl = document.getElementById('login-error');
+  const role = state.selectedLoginRole;
+  if(!email || !pass){ errEl.style.display='block'; errEl.textContent='Email dan password wajib diisi.'; return; }
+  if(!email.includes('@')){ errEl.style.display='block'; errEl.textContent='Gunakan email yang terdaftar di Firebase Authentication.'; return; }
+  if(!FB_AUTH){ errEl.style.display='block'; errEl.textContent='Firebase belum berhasil diinisialisasi.'; return; }
+  errEl.style.display='none';
+  const btn=document.querySelector('#login-box .btn-primary'); if(btn){btn.disabled=true;btn.textContent='Menghubungkan...';}
+  try{
+    const cred=await FB_AUTH.signInWithEmailAndPassword(email,pass);
+    const profile=await fbGetUserProfile(cred.user.uid);
+    if(!profile){
+      await FB_AUTH.signOut();
+      throw new Error('Profil user belum tersedia di Firestore. Buat dokumen users/'+cred.user.uid+' dengan field role sesuai portal.');
+    }
+    if(profile.status && profile.status!=='Active'){
+      await FB_AUTH.signOut();
+      throw new Error('Akun Anda berstatus Inactive. Hubungi Super Admin.');
+    }
+    if(profile.role!==role){
+      await FB_AUTH.signOut();
+      throw new Error('Role akun adalah '+(ROLES[profile.role]?.label||profile.role)+', bukan '+ROLES[role].label+'. Pilih portal yang sesuai.');
+    }
+    const user={
+      id:cred.user.uid, firebaseUid:cred.user.uid,
+      name:profile.name||cred.user.displayName||email.split('@')[0],
+      username:profile.username||email, email:cred.user.email,
+      role:profile.role, team:profile.team||'-', campaign:profile.campaign||'BMKG 196',
+      agentId:profile.agentId||profile.username||cred.user.uid.slice(0,8).toUpperCase(),
+      supervisor:profile.supervisor||'-', joinDate:profile.joinDate||todayISO(), status:profile.status||'Active'
+    };
+    state.currentUser=user;
+    await fbLoadMyAttempts(cred.user.uid);
+    doLogin(user);
+    showToast('Login Firebase berhasil','success');
+  }catch(err){
+    console.error(err);
+    errEl.style.display='block'; errEl.textContent=err.message||'Login gagal. Periksa email dan password.';
+  }finally{
+    if(btn){btn.disabled=false;btn.textContent='Login sebagai '+(ROLES[role]?.label||'User');}
+  }
+};
+
+/* Firebase session persistence: keep the current design and restore login on refresh. */
+if(FB_AUTH){
+  FB_AUTH.onAuthStateChanged(async user=>{
+    if(!user || state.currentUser) return;
+    try{
+      const profile=await fbGetUserProfile(user.uid);
+      if(!profile || profile.status==='Inactive') return;
+      state.currentUser={id:user.uid,firebaseUid:user.uid,name:profile.name||user.email.split('@')[0],username:profile.username||user.email,email:user.email,role:profile.role,team:profile.team||'-',campaign:profile.campaign||'BMKG 196',agentId:profile.agentId||profile.username||user.uid.slice(0,8).toUpperCase(),supervisor:profile.supervisor||'-',joinDate:profile.joinDate||todayISO(),status:profile.status||'Active'};
+      await fbLoadMyAttempts(user.uid);
+      document.getElementById('screen-login').classList.remove('active');
+      document.getElementById('screen-app').classList.add('active');
+      buildSidebar(); renderTopbarUser(); navigate('dashboard'); renderNotifBadge(); document.getElementById('ai-fab').classList.remove('hidden');
+    }catch(e){console.warn('[Firebase] session restore failed',e);}
+  });
+}
+
+/* Logout from Firebase as well as the existing UI session. */
+const __legacyLogout = handleLogout;
+handleLogout = async function(){
+  try{ await fbSaveAudit('Logout','User logout'); }catch(e){}
+  if(FB_AUTH){ try{ await FB_AUTH.signOut(); }catch(e){} }
+  __legacyLogout();
+};
+
+/* Persist quiz attempts without changing the existing quiz/result UI. */
+const __legacySubmitQuiz = submitQuiz;
+submitQuiz = function(auto){
+  __legacySubmitQuiz(auto);
+  setTimeout(async()=>{
+    try{
+      const latest=DB.attempts.filter(a=>a.agentId===state.currentUser?.id).sort((a,b)=>new Date(b.submittedAt)-new Date(a.submittedAt))[0];
+      if(latest) await fbSaveAttempt(latest);
+    }catch(e){console.warn('[Firebase] attempt save failed',e);}
+  },100);
+};
+
+/* Mirror audit entries created by the existing UI into Firestore. */
+const __legacyLogAudit = logAudit;
+logAudit = function(activity, detail){
+  __legacyLogAudit(activity,detail);
+  fbSaveAudit(activity,detail).catch(e=>console.warn('[Firebase] audit save failed',e));
+};
+
+/* Public helper for Admin: sync current demo/master data into Firestore. */
+window.syncKnowledgeHubToFirestore = async function(){
+  if(!FB_DB) throw new Error('Firebase belum siap.');
+  const batch=FB_DB.batch();
+  const maps={knowledge:DB.knowledge||[],questions:DB.questions||[],quizzes:DB.quizzes||[],products:DB.products||[],notifications:DB.notifications||[]};
+  Object.entries(maps).forEach(([collection,items])=>items.slice(0,500).forEach(item=>{
+    const id=String(item.id||uid('FB'));
+    batch.set(FB_DB.collection(collection).doc(id),{...item, syncedAt:firebase.firestore.FieldValue.serverTimestamp()},{merge:true});
+  }));
+  await batch.commit();
+  showToast('Master data berhasil disinkronkan ke Firestore','success');
+};
+
+/* Firebase status is available in the browser console for verification. */
+window.KnowledgeHubFirebase={app:FB_APP,auth:FB_AUTH,db:FB_DB,config:FIREBASE_CONFIG};
 
 </script>
 </body>

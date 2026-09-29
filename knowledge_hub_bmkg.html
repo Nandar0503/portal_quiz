@@ -3413,7 +3413,7 @@ handleLogin = async function(){
       await FB_AUTH.signOut();
       throw new Error('Profil user belum tersedia di Firestore. Buat dokumen users/'+cred.user.uid+' dengan field role sesuai portal.');
     }
-    if(profile.status && profile.status!=='Active'){
+    if(!fbStatusActive(profile.status)){
       await FB_AUTH.signOut();
       throw new Error('Akun Anda berstatus Inactive. Hubungi Super Admin.');
     }
@@ -3427,7 +3427,7 @@ handleLogin = async function(){
       username:profile.username||email, email:cred.user.email,
       role:profile.role, team:profile.team||'-', campaign:profile.campaign||'BMKG 196',
       agentId:profile.agentId||profile.username||cred.user.uid.slice(0,8).toUpperCase(),
-      supervisor:profile.supervisor||'-', joinDate:profile.joinDate||todayISO(), status:profile.status||'Active'
+      supervisor:profile.supervisor||'-', joinDate:profile.joinDate||todayISO(), status:'Active'
     };
     state.currentUser=user;
     await fbLoadMyAttempts(cred.user.uid);
@@ -3448,7 +3448,7 @@ if(FB_AUTH){
     if(!user || state.currentUser) return;
     try{
       const profile=await fbGetUserProfile(user.uid);
-      if(!profile || profile.status==='Inactive') return;
+      if(!profile || !fbStatusActive(profile.status)) return;
       state.currentUser={id:user.uid,firebaseUid:user.uid,name:profile.name||user.email.split('@')[0],username:profile.username||user.email,email:user.email,role:profile.role,team:profile.team||'-',campaign:profile.campaign||'BMKG 196',agentId:profile.agentId||profile.username||user.uid.slice(0,8).toUpperCase(),supervisor:profile.supervisor||'-',joinDate:profile.joinDate||todayISO(),status:profile.status||'Active'};
       await fbLoadMyAttempts(user.uid);
       document.getElementById('screen-login').classList.remove('active');
@@ -3601,6 +3601,7 @@ function fbRerenderIfIdle(){
 async function fbStartShared(){
   if(!FB_DB || !FB_AUTH?.currentUser || __fbStarted) return;
   __fbStarted = true;
+  fbStartUsers();
   let seeded = 0;
   for(const c of FB_SHARED){
     try{
@@ -3642,6 +3643,251 @@ function fbStopShared(){
 window.addEventListener('beforeunload', e=>{
   if(fbCanWrite() && FB_SHARED.some(fbHasLocalChanges)){ fbPersistShared(); e.preventDefault(); e.returnValue=''; }
 });
+
+/* ===================== USER MANAGEMENT (FIREBASE) =====================
+   Super Admin dapat menambah akun login, mengganti role/team/status, mengirim
+   reset password, dan menghapus profil langsung dari aplikasi.
+   - Akun Authentication dibuat lewat instance Firebase kedua ("user-admin")
+     sehingga sesi Super Admin tidak ikut berganti.
+   - Profil disimpan di users/{uid}; perubahan tampil realtime.
+   - Akun demo bawaan tetap ada (untuk data contoh dashboard) tetapi ditandai "Demo". */
+const FB_USER_VIEW_ROLES = ['super_admin','trainer','supervisor','management'];
+const FB_ROLE_PREFIX = {agent:'AGT', supervisor:'SPV', trainer:'TRN', management:'MGT', super_admin:'ADM'};
+let __fbSecondaryAuth = null;
+
+function fbIsAdmin(){ return !!(FB_DB && FB_AUTH?.currentUser && state.currentUser?.role==='super_admin'); }
+function fbIsSelf(uid){ return uid===FB_AUTH?.currentUser?.uid; }
+function fbStatusActive(s){ return String(s||'Active').trim().toLowerCase()==='active'; }
+function fbProfileToUser(uid, p){
+  return { id:uid, fb:true, firebaseUid:uid,
+    name:p.name||(p.email||'').split('@')[0]||'-', username:p.username||p.email||uid, email:p.email||'-',
+    role: ROLES[p.role] ? p.role : 'agent', roleRaw:p.role||'',
+    team:p.team||'-', campaign:p.campaign||'-', supervisor:p.supervisor||'-',
+    agentId:p.agentId||'-', joinDate:p.joinDate||todayISO(),
+    status: fbStatusActive(p.status) ? 'Active' : 'Inactive' };
+}
+function fbMergeUsers(fbUsers){
+  const ids = new Set(fbUsers.map(u=>u.id));
+  DB.users = [...fbUsers, ...DB.users.filter(u=>!u.fb && !ids.has(u.id))];
+}
+function fbStartUsers(){
+  const me = FB_AUTH?.currentUser; if(!me || !FB_DB) return;
+  if(state.currentUser && !findUser(state.currentUser.id)) DB.users.unshift({...state.currentUser, fb:true});
+
+  // Profil sendiri: logout otomatis bila dinonaktifkan, dihapus, atau role-nya diubah.
+  __fbUnsubs.push(FB_DB.collection('users').doc(me.uid).onSnapshot(d=>{
+    if(!state.currentUser || !FB_AUTH.currentUser) return;
+    const p = d.exists ? d.data() : null;
+    if(!p || !fbStatusActive(p.status)){ showToast('Akun Anda dinonaktifkan oleh Administrator.','error'); handleLogout(); return; }
+    if(p.role && p.role!==state.currentUser.role){ showToast('Role Anda diubah menjadi '+(ROLES[p.role]?.label||p.role)+'. Silakan login ulang.','info'); handleLogout(); }
+  }, ()=>{}));
+
+  if(!FB_USER_VIEW_ROLES.includes(state.currentUser?.role)) return;
+  __fbUnsubs.push(FB_DB.collection('users').onSnapshot(snap=>{
+    fbMergeUsers(snap.docs.map(d=>fbProfileToUser(d.id, d.data())).sort((a,b)=>a.name.localeCompare(b.name)));
+    if(state.route==='users'){ if(document.getElementById('um-table')) renderUserTable(); }
+    else fbRerenderIfIdle();
+  }, e=>console.warn('[Firebase] listener users berhenti:', e.code||e.message)));
+}
+
+async function fbSecondaryAuth(){
+  if(!__fbSecondaryAuth){
+    const app = firebase.apps.find(a=>a.name==='user-admin') || firebase.initializeApp(FIREBASE_CONFIG,'user-admin');
+    __fbSecondaryAuth = app.auth();
+    try{ await __fbSecondaryAuth.setPersistence(firebase.auth.Auth.Persistence.NONE); }catch(e){}
+  }
+  return __fbSecondaryAuth;
+}
+function fbRandomPassword(){
+  const chars='abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  return Array.from(crypto.getRandomValues(new Uint8Array(14)), b=>chars[b%chars.length]).join('')+'#7';
+}
+function fbErrorText(e){
+  const map = {
+    'auth/email-already-in-use':'Email sudah terdaftar di Authentication. Salin UID akun tersebut dari Firebase Console → Authentication, isi kolom "UID akun yang sudah ada", lalu simpan lagi.',
+    'auth/invalid-email':'Format email tidak valid.',
+    'auth/weak-password':'Password minimal 6 karakter.',
+    'auth/operation-not-allowed':'Pendaftaran Email/Password dinonaktifkan di Firebase Authentication.',
+    'auth/admin-restricted-operation':'Pembuatan akun dari aplikasi diblokir di pengaturan Firebase Authentication (User actions → Enable create).',
+    'auth/too-many-requests':'Terlalu banyak percobaan. Coba lagi beberapa menit lagi.',
+    'permission-denied':'Ditolak oleh Firestore Rules. Pastikan rules terbaru sudah di-publish dan Anda login sebagai Super Admin.'
+  };
+  return map[e?.code] || e?.message || 'Terjadi kesalahan.';
+}
+
+/* ---------- Halaman ---------- */
+const __legacyRenderUM = renderUserManagementPage, __legacyRenderUT = renderUserTable,
+      __legacyToggleUS = toggleUserStatus, __legacyOpenUF = openUserForm, __legacySaveUser = saveUser;
+
+renderUserManagementPage = function(){
+  if(!FB_AUTH?.currentUser) return __legacyRenderUM();
+  const main = document.getElementById('main-content');
+  const nFb = DB.users.filter(u=>u.fb).length, nDemo = DB.users.filter(u=>!u.fb).length;
+  main.innerHTML = `<div class="section-head"><div><h2>👤 User Management</h2><p>${nFb} akun Firebase · ${nDemo} akun demo</p></div>
+  ${fbIsAdmin()?'<button class="btn btn-primary" onclick="openUserForm()">+ Tambah User</button>':''}</div>
+  ${fbIsAdmin()?'':'<div class="card" style="margin-bottom:14px;">Hanya Super Admin yang dapat menambah atau mengubah user.</div>'}
+  <div class="chip-filter">
+    <select id="um-f-src" onchange="renderUserTable()"><option value="fb">Akun Firebase</option><option value="demo">Akun Demo</option><option value="">Semua Akun</option></select>
+    <select id="um-f-role" onchange="renderUserTable()"><option value="">Semua Role</option>${Object.entries(ROLES).map(([k,r])=>'<option value="'+k+'">'+r.label+'</option>').join('')}</select>
+    <input type="search" id="um-f-search" placeholder="Cari nama / email..." oninput="renderUserTable()" style="max-width:220px;"></div>
+  <div id="um-table"></div>`;
+  renderUserTable();
+};
+ROUTES.users = renderUserManagementPage;
+
+renderUserTable = function(){
+  if(!FB_AUTH?.currentUser || !document.getElementById('um-f-src')) return __legacyRenderUT();
+  const src = document.getElementById('um-f-src').value, roleF = document.getElementById('um-f-role').value,
+        term = document.getElementById('um-f-search').value.toLowerCase(), admin = fbIsAdmin();
+  const list = DB.users.filter(u=>(src==='' || (src==='fb') === !!u.fb) && (!roleF||u.role===roleF) &&
+    (!term || (u.name||'').toLowerCase().includes(term) || (u.username||'').toLowerCase().includes(term) || (u.email||'').toLowerCase().includes(term)));
+  const roleCell = u=>{
+    if(admin && u.fb && !fbIsSelf(u.id))
+      return `<select onchange="fbQuickRole('${u.id}',this.value)" style="min-width:130px;">${Object.entries(ROLES).map(([k,r])=>'<option value="'+k+'" '+(u.role===k?'selected':'')+'>'+r.icon+' '+r.label+'</option>').join('')}</select>`
+        + (u.roleRaw && !ROLES[u.roleRaw] ? '<div class="small-muted" style="color:var(--red-600);">role tidak valid: '+esc(u.roleRaw)+'</div>' : '');
+    return `<span class="pill pill-blue">${ROLES[u.role].icon} ${ROLES[u.role].label}</span>`;
+  };
+  const actions = u=>{
+    if(!u.fb) return '<span class="small-muted">Demo</span>';
+    if(!admin) return '';
+    const self = fbIsSelf(u.id);
+    return `<button class="btn btn-ghost btn-sm" title="Edit" onclick="openUserForm('${u.id}')">✏️</button>`
+      + (self?'':`<button class="btn btn-ghost btn-sm" title="${u.status==='Active'?'Nonaktifkan':'Aktifkan'}" onclick="toggleUserStatus('${u.id}')">${u.status==='Active'?'🔒':'🔓'}</button>`)
+      + (u.email&&u.email!=='-'?`<button class="btn btn-ghost btn-sm" title="Kirim email reset password" onclick="fbSendReset('${u.id}')">✉️</button>`:'')
+      + (self?'':`<button class="btn btn-ghost btn-sm" title="Hapus profil" onclick="fbDeleteUserProfile('${u.id}')">🗑️</button>`);
+  };
+  document.getElementById('um-table').innerHTML = `<div class="table-wrap"><table><thead><tr><th>Nama</th><th>Email / Username</th><th>Role</th><th>Team</th><th>Campaign</th><th>Status</th><th>Akun</th><th></th></tr></thead><tbody>
+  ${list.map(u=>`<tr><td class="flex items-center gap-8"><div class="avatar" style="width:28px; height:28px; font-size:11px;">${initials(u.name)}</div>${esc(u.name)}${fbIsSelf(u.id)?' <span class="small-muted">(Anda)</span>':''}</td>
+    <td>${esc(u.fb?u.email:u.username)}</td><td>${roleCell(u)}</td><td>${esc(u.team)}</td><td>${esc(u.campaign)}</td>
+    <td><span class="pill ${u.status==='Active'?'pill-green':'pill-red'}">${u.status}</span></td>
+    <td><span class="pill ${u.fb?'pill-blue':'pill-gray'}">${u.fb?'Firebase':'Demo'}</span></td>
+    <td class="flex gap-6">${actions(u)}</td></tr>`).join('') || '<tr><td colspan="8">'+emptyState('👤','Tidak ada user')+'</td></tr>'}
+  </tbody></table></div>`;
+};
+
+/* ---------- Aksi cepat ---------- */
+async function fbUpdateUser(uid, data, auditMsg){
+  await FB_DB.collection('users').doc(uid).set({...data, updatedAt:firebase.firestore.FieldValue.serverTimestamp(), updatedBy:state.currentUser.email||'-'},{merge:true});
+  if(auditMsg) logAudit('Edit User', auditMsg);
+}
+async function fbQuickRole(uid, role){
+  const u = findUser(uid); if(!u || !fbIsAdmin() || fbIsSelf(uid)) return;
+  try{ await fbUpdateUser(uid,{role},'Role '+u.name+' diubah dari '+(ROLES[u.role]?.label||u.role)+' ke '+ROLES[role].label);
+       showToast('Role '+u.name+' → '+ROLES[role].label,'success'); }
+  catch(e){ showToast(fbErrorText(e),'error'); renderUserTable(); }
+}
+toggleUserStatus = function(id){
+  const u = findUser(id);
+  if(!u?.fb || !FB_AUTH?.currentUser) return __legacyToggleUS(id);
+  if(!fbIsAdmin() || fbIsSelf(id)) return;
+  const next = u.status==='Active' ? 'Inactive' : 'Active';
+  confirmAction((next==='Inactive'?'Nonaktifkan':'Aktifkan')+' akun '+u.name+'?'+(next==='Inactive'?' User tidak akan bisa login dan akan otomatis keluar jika sedang login.':''), async()=>{
+    try{ await fbUpdateUser(id,{status:next}); logAudit('Update User Status','User '+u.name+' diubah ke status '+next); showToast('Status '+u.name+' → '+next,'success'); }
+    catch(e){ showToast(fbErrorText(e),'error'); }
+  });
+};
+async function fbSendReset(uid){
+  const u = findUser(uid); if(!u?.email || u.email==='-') return;
+  try{ await FB_AUTH.sendPasswordResetEmail(u.email); logAudit('Reset Password','Email reset password dikirim ke '+u.email); showToast('Email reset password dikirim ke '+u.email,'success'); }
+  catch(e){ showToast(fbErrorText(e),'error'); }
+}
+function fbDeleteUserProfile(uid){
+  const u = findUser(uid); if(!u || !fbIsAdmin() || fbIsSelf(uid)) return;
+  confirmAction('Hapus profil '+u.name+'? User tidak bisa login lagi. Catatan: akun email di Firebase Authentication tetap ada; hapus manual di Firebase Console bila perlu.', async()=>{
+    try{ await FB_DB.collection('users').doc(uid).delete(); logAudit('Delete User','Profil '+u.name+' ('+u.email+') dihapus'); showToast('Profil '+u.name+' dihapus','success'); }
+    catch(e){ showToast(fbErrorText(e),'error'); }
+  });
+}
+
+/* ---------- Form tambah / edit ---------- */
+openUserForm = function(uid){
+  const u = uid ? findUser(uid) : null;
+  if(!FB_AUTH?.currentUser || (u && !u.fb)) return __legacyOpenUF(uid);
+  if(!fbIsAdmin()){ showToast('Hanya Super Admin yang dapat mengubah user.','error'); return; }
+  const self = u && fbIsSelf(u.id);
+  const opt = (v,cur)=>'<option value="'+esc(v)+'" '+(v===cur?'selected':'')+'>'+esc(v)+'</option>';
+  const spvs = ['-', ...new Set(DB.users.filter(x=>x.role==='supervisor').map(x=>x.name))];
+  const camps = ['-', ...new Set([...DB.campaigns, ...(u&&u.campaign&&u.campaign!=='-'?[u.campaign]:[])])];
+  openModal(modalHeader(u?'Edit User':'Tambah User Baru') + `
+    <div class="modal-body">
+      <div class="grid-2"><div class="field"><label>Nama Lengkap *</label><input id="uf-name" value="${u?esc(u.name):''}"></div>
+      <div class="field"><label>Email Login *</label><input type="email" id="uf-email" value="${u?esc(u.email):''}" ${u?'disabled':''} placeholder="nama@domain.com"></div></div>
+      <div class="grid-2"><div class="field"><label>Role</label><select id="uf-role" ${self?'disabled':''}>${Object.entries(ROLES).map(([k,r])=>'<option value="'+k+'" '+((u?u.role:'agent')===k?'selected':'')+'>'+r.icon+' '+r.label+'</option>').join('')}</select>${self?'<div class="small-muted">Role akun sendiri tidak bisa diubah.</div>':''}</div>
+      <div class="field"><label>Agent ID / Kode</label><input id="uf-agentid" value="${u&&u.agentId!=='-'?esc(u.agentId):''}" placeholder="otomatis bila kosong"></div></div>
+      <div class="grid-2"><div class="field"><label>Team</label><input id="uf-team" list="uf-team-list" value="${u?esc(u.team):'-'}"><datalist id="uf-team-list">${DB.teams.map(t=>'<option value="'+esc(t.name)+'">').join('')}</datalist></div>
+      <div class="field"><label>Campaign</label><select id="uf-campaign">${camps.map(c=>opt(c,u?u.campaign:'-')).join('')}</select></div></div>
+      <div class="grid-2"><div class="field"><label>Supervisor</label><select id="uf-supervisor">${[...new Set([...spvs, ...(u&&u.supervisor?[u.supervisor]:[])])].map(s=>opt(s,u?u.supervisor:'-')).join('')}</select></div>
+      ${u?`<div class="field"><label>Status</label><select id="uf-status" ${self?'disabled':''}>${opt('Active',u.status)}${opt('Inactive',u.status)}</select></div>`:'<div></div>'}</div>
+      ${u?'':`<div class="grid-2"><div class="field"><label>Password awal (opsional)</label><input type="text" id="uf-password" placeholder="kosongkan = user atur sendiri via email" autocomplete="new-password"></div>
+      <div class="field"><label>&nbsp;</label><label style="font-weight:400;"><input type="checkbox" id="uf-sendreset" checked style="width:auto;"> Kirim email untuk mengatur password</label></div></div>
+      <details style="margin-top:6px;"><summary class="small-muted" style="cursor:pointer;">Email sudah terdaftar di Authentication?</summary>
+        <div class="field" style="margin-top:8px;"><label>UID akun yang sudah ada</label><input id="uf-uid" placeholder="salin dari Firebase Console → Authentication"></div></details>`}
+      <div id="uf-error" class="small-muted" style="color:var(--red-600); margin-top:8px; display:none;"></div>
+    </div>
+    <div class="modal-foot"><button class="btn btn-outline" onclick="closeModal()">Batal</button><button class="btn btn-primary" id="uf-save" onclick="saveUser('${uid||''}')">${u?'Simpan Perubahan':'Buat Akun'}</button></div>
+  `);
+};
+
+saveUser = async function(uid){
+  const existing = uid ? findUser(uid) : null;
+  if(!FB_AUTH?.currentUser || (existing && !existing.fb)) return __legacySaveUser(uid);
+  if(!fbIsAdmin()) return;
+  const $ = id=>document.getElementById(id), errEl = $('uf-error'), btn = $('uf-save');
+  const fail = msg=>{ errEl.style.display='block'; errEl.textContent=msg; };
+  errEl.style.display='none';
+  const name = $('uf-name').value.trim();
+  if(!name) return fail('Nama wajib diisi.');
+  const role = $('uf-role').value;
+  const payload = { name, role, team:$('uf-team').value.trim()||'-', campaign:$('uf-campaign').value, supervisor:$('uf-supervisor').value };
+  const agentIdIn = $('uf-agentid').value.trim();
+  const label = btn.textContent; btn.disabled = true; btn.textContent = 'Menyimpan...';
+  try{
+    if(existing){
+      if(fbIsSelf(uid)){ payload.role = existing.role; }
+      else payload.status = $('uf-status').value;
+      payload.agentId = agentIdIn || existing.agentId;
+      const changes = [];
+      if(payload.role!==existing.role) changes.push('role '+ROLES[existing.role].label+' → '+ROLES[payload.role].label);
+      if(payload.status && payload.status!==existing.status) changes.push('status → '+payload.status);
+      await fbUpdateUser(uid, payload, 'User '+name+' diperbarui'+(changes.length?' ('+changes.join(', ')+')':''));
+      showToast('User '+name+' diperbarui','success');
+    }else{
+      const email = $('uf-email').value.trim().toLowerCase();
+      if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw {message:'Email wajib diisi dengan format yang benar.'};
+      if(DB.users.some(x=>x.fb && (x.email||'').toLowerCase()===email)) throw {message:'Email ini sudah punya profil di daftar user.'};
+      const pw = $('uf-password').value, sendReset = $('uf-sendreset').checked;
+      if(pw && pw.length<6) throw {message:'Password minimal 6 karakter.'};
+      let newUid = $('uf-uid').value.trim();
+      if(!newUid){
+        const sec = await fbSecondaryAuth();
+        const cred = await sec.createUserWithEmailAndPassword(email, pw || fbRandomPassword());
+        newUid = cred.user.uid;
+        try{ await sec.signOut(); }catch(e){}
+      }
+      try{
+        await FB_DB.collection('users').doc(newUid).set({...payload, email, username:email,
+          agentId: agentIdIn || (FB_ROLE_PREFIX[role]||'USR')+'-'+newUid.slice(0,5).toUpperCase(),
+          status:'Active', joinDate:todayISO(), createdAt:firebase.firestore.FieldValue.serverTimestamp(), createdBy:state.currentUser.email||'-'});
+      }catch(e){
+        e.message = 'Akun login sudah dibuat (UID '+newUid+') tetapi profil gagal disimpan: '+fbErrorText(e)+' Perbaiki lalu simpan ulang dengan mengisi UID tersebut.';
+        e.code = null; throw e;
+      }
+      logAudit('Create User','User baru "'+name+'" ('+email+') dibuat sebagai '+ROLES[role].label);
+      let msg = 'Akun '+email+' berhasil dibuat';
+      if(sendReset || !pw){
+        try{ await FB_AUTH.sendPasswordResetEmail(email); msg += ' — email atur password terkirim'; }
+        catch(e){ msg += ' — email atur password gagal dikirim ('+(e.code||e.message)+')'; }
+      }
+      showToast(msg,'success');
+    }
+    closeModal();
+    if(state.route==='users') renderUserManagementPage();
+  }catch(e){
+    fail(fbErrorText(e));
+  }finally{
+    if(document.body.contains(btn)){ btn.disabled=false; btn.textContent=label; }
+  }
+};
 
 /* Helper untuk Admin (console): paksa simpan semua perubahan sekarang. */
 window.syncKnowledgeHubToFirestore = async function(){

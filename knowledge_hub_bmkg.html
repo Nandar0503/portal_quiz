@@ -2453,7 +2453,7 @@ function saveQuestion(qid){
     logAudit('Edit Question','Soal '+qid+' diperbarui');
     showToast('Soal berhasil diperbarui','success');
   } else {
-    const nq = Object.assign({id:'Q-'+String(DB.questions.length+1).padStart(3,'0')+'-'+Math.floor(rand()*99), status:'Draft', createdBy:state.currentUser.name, stats:{shown:0,correct:0,wrong:0,skip:0,totalTimeSec:0}}, payload);
+    const nq = Object.assign({id:'Q-'+String(DB.questions.length+1).padStart(3,'0')+'-'+Math.random().toString(36).slice(2,7), status:'Draft', createdBy:state.currentUser.name, stats:{shown:0,correct:0,wrong:0,skip:0,totalTimeSec:0}}, payload);
     DB.questions.unshift(nq);
     logAudit('Create Question','Soal baru dibuat: "'+question.slice(0,50)+'..."');
     showToast('Soal baru berhasil dibuat (status: Draft)','success');
@@ -3432,6 +3432,7 @@ handleLogin = async function(){
     state.currentUser=user;
     await fbLoadMyAttempts(cred.user.uid);
     doLogin(user);
+    fbStartShared();
     showToast('Login Firebase berhasil','success');
   }catch(err){
     console.error(err);
@@ -3453,6 +3454,7 @@ if(FB_AUTH){
       document.getElementById('screen-login').classList.remove('active');
       document.getElementById('screen-app').classList.add('active');
       buildSidebar(); renderTopbarUser(); navigate('dashboard'); renderNotifBadge(); document.getElementById('ai-fab').classList.remove('hidden');
+      fbStartShared();
     }catch(e){console.warn('[Firebase] session restore failed',e);}
   });
 }
@@ -3461,6 +3463,8 @@ if(FB_AUTH){
 const __legacyLogout = handleLogout;
 handleLogout = async function(){
   try{ await fbSaveAudit('Logout','User logout'); }catch(e){}
+  try{ await fbPersistShared(); }catch(e){}
+  fbStopShared();
   if(FB_AUTH){ try{ await FB_AUTH.signOut(); }catch(e){} }
   __legacyLogout();
 };
@@ -3482,19 +3486,168 @@ const __legacyLogAudit = logAudit;
 logAudit = function(activity, detail){
   __legacyLogAudit(activity,detail);
   fbSaveAudit(activity,detail).catch(e=>console.warn('[Firebase] audit save failed',e));
+  fbSchedulePersist();
 };
 
-/* Public helper for Admin: sync current demo/master data into Firestore. */
+/* ===================== SHARED MASTER DATA (FIRESTORE SYNC) =====================
+   Knowledge, soal, quiz, dan produk disimpan di Firestore sehingga perubahan
+   terlihat di semua login/perangkat.
+   - Setelah login: data dimuat dari Firestore dan dipantau realtime (onSnapshot).
+   - Jika koleksi masih kosong dan yang login super_admin/trainer: data bawaan
+     di file ini otomatis diunggah sebagai data awal.
+   - Setiap tambah/ubah/hapus oleh super_admin/trainer dideteksi (diff per
+     dokumen) lalu ditulis ke Firestore. Role lain hanya membaca.            */
+const FB_SHARED = ['knowledge','questions','quizzes','products'];
+const FB_WRITER_ROLES = ['super_admin','trainer'];
+const FB_SERVER_FIELDS = ['syncedAt','updatedAt','_updatedBy'];
+const __fbSnap = {};            // koleksi -> Map(id -> JSON terakhir yang sinkron dengan server)
+let __fbUnsubs = [], __fbSyncing = false, __fbPersistTimer = null, __fbPollTimer = null,
+    __fbStarted = false, __fbErrShown = false, __fbRerenderTimer = null;
+
+function fbCanWrite(){
+  return !!(FB_DB && FB_AUTH?.currentUser && state.currentUser && FB_WRITER_ROLES.includes(state.currentUser.role));
+}
+function fbStripServerFields(obj){
+  const o = {...obj}; FB_SERVER_FIELDS.forEach(k=>delete o[k]); return o;
+}
+function fbSerialize(c){
+  const m = new Map();
+  (DB[c]||[]).forEach(it=>{ if(it && it.id!=null) m.set(String(it.id), JSON.stringify(fbStripServerFields(it))); });
+  return m;
+}
+/* _created menjaga urutan tampilan (terbaru di atas) karena Firestore tidak menyimpan urutan array. */
+function fbStampOrder(c){
+  let base = Date.now();
+  (DB[c]||[]).forEach(it=>{ if(it && it.id!=null && it._created==null) it._created = base--; });
+}
+function fbHasLocalChanges(c){
+  if(!fbCanWrite()) return false;                            // role baca-saja: perubahan lokal tidak disimpan
+  const prev = __fbSnap[c]; if(!prev) return false;
+  const cur = fbSerialize(c);
+  if(cur.size!==prev.size) return true;
+  for(const [id,json] of cur){ if(prev.get(id)!==json) return true; }
+  return false;
+}
+function fbDocsToList(snap){
+  return snap.docs.map(d=>fbStripServerFields({...d.data(), id:d.data().id ?? d.id}))
+    .sort((a,b)=>(b._created||0)-(a._created||0));
+}
+/* Ganti data koleksi dengan versi server, tetapi pertahankan quiz remedial
+   pribadi yang dibuat otomatis di perangkat ini (tidak disimpan ke server). */
+function fbApplyRemote(c, snap){
+  const list = fbDocsToList(snap);
+  if(c==='quizzes'){
+    const ids = new Set(list.map(x=>String(x.id)));
+    (DB.quizzes||[]).forEach(q=>{ if(q && q.isRemedial && !ids.has(String(q.id))) list.push(q); });
+  }
+  DB[c] = list;
+  __fbSnap[c] = fbSerialize(c);
+}
+
+/* Tulis perbedaan lokal -> Firestore. Aman dipanggil berulang kali. */
+async function fbPersistShared(){
+  if(__fbSyncing || !fbCanWrite()) return;
+  __fbSyncing = true;
+  const backup = {};
+  try{
+    const ops = [];
+    for(const c of FB_SHARED){
+      const prev = __fbSnap[c]; if(!prev) continue;          // belum selesai dimuat
+      fbStampOrder(c);
+      const cur = fbSerialize(c);
+      cur.forEach((json,id)=>{ if(prev.get(id)!==json) ops.push({type:'set', c, id, data:JSON.parse(json)}); });
+      prev.forEach((_,id)=>{ if(!cur.has(id)) ops.push({type:'delete', c, id}); });
+      backup[c] = prev; __fbSnap[c] = cur;
+    }
+    if(!ops.length) return;
+    for(let i=0; i<ops.length; i+=400){
+      const batch = FB_DB.batch();
+      ops.slice(i,i+400).forEach(op=>{
+        const ref = FB_DB.collection(op.c).doc(op.id);
+        if(op.type==='delete') batch.delete(ref);
+        else batch.set(ref, {...op.data, updatedAt:firebase.firestore.FieldValue.serverTimestamp(), _updatedBy:state.currentUser?.email||'-'});
+      });
+      await batch.commit();
+    }
+    __fbErrShown = false;
+    console.info('[Firebase] '+ops.length+' perubahan data disimpan ke Firestore');
+  }catch(e){
+    Object.assign(__fbSnap, backup);                          // coba lagi pada siklus berikutnya
+    console.error('[Firebase] gagal menyimpan data', e);
+    if(!__fbErrShown){ __fbErrShown = true; showToast('Gagal menyimpan ke server: '+(e.code||e.message),'error'); }
+  }finally{
+    __fbSyncing = false;
+  }
+}
+function fbSchedulePersist(){
+  if(!__fbStarted) return;
+  clearTimeout(__fbPersistTimer);
+  __fbPersistTimer = setTimeout(fbPersistShared, 300);
+}
+
+/* Render ulang halaman aktif setelah data dari server berubah,
+   kecuali user sedang mengerjakan quiz, membuka form/modal, atau mengetik. */
+function fbRerenderIfIdle(){
+  clearTimeout(__fbRerenderTimer);
+  __fbRerenderTimer = setTimeout(()=>{
+    if(!state.currentUser || state.quizSession) return;
+    if(document.getElementById('modal-root')?.innerHTML.trim()) return;
+    const a = document.activeElement;
+    if(a && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName)) return;
+    if(state.route && ROUTES[state.route]){ const y = window.scrollY; navigate(state.route, state.routeParam); window.scrollTo(0,y); }
+  }, 250);
+}
+
+async function fbStartShared(){
+  if(!FB_DB || !FB_AUTH?.currentUser || __fbStarted) return;
+  __fbStarted = true;
+  let seeded = 0;
+  for(const c of FB_SHARED){
+    try{
+      const snap = await FB_DB.collection(c).get();
+      if(snap.empty){
+        if(fbCanWrite()){                                      // data awal dari file ini
+          fbStampOrder(c);
+          __fbSnap[c] = new Map();                             // semua item terhitung "baru"
+          seeded += (DB[c]||[]).length;
+        }
+      }else{
+        fbApplyRemote(c, snap);
+      }
+    }catch(e){ console.warn('[Firebase] gagal memuat '+c, e.code||e.message); }
+  }
+  if(seeded){ await fbPersistShared(); showToast(seeded+' data awal diunggah ke Firestore','success'); }
+  fbRerenderIfIdle();
+
+  FB_SHARED.forEach(c=>{
+    const unsub = FB_DB.collection(c).onSnapshot(snap=>{
+      if(snap.metadata.hasPendingWrites) return;              // tulisan kita sendiri, belum dikonfirmasi
+      if(fbHasLocalChanges(c)){ fbSchedulePersist(); return; } // jangan timpa perubahan yang belum tersimpan
+      if(snap.empty && !__fbSnap[c]) return;                  // koleksi kosong & tidak ada yang bisa mengisi
+      fbApplyRemote(c, snap);
+      if(snap.docChanges().length) fbRerenderIfIdle();
+    }, e=>console.warn('[Firebase] listener '+c+' berhenti:', e.code||e.message));
+    __fbUnsubs.push(unsub);
+  });
+
+  // Jaring pengaman: menangkap perubahan yang tidak memanggil logAudit.
+  __fbPollTimer = setInterval(()=>{ if(fbCanWrite()) fbPersistShared(); }, 3000);
+}
+function fbStopShared(){
+  __fbUnsubs.forEach(u=>{ try{u();}catch(e){} });
+  __fbUnsubs = []; clearInterval(__fbPollTimer); clearTimeout(__fbPersistTimer);
+  FB_SHARED.forEach(c=>delete __fbSnap[c]);
+  __fbStarted = false;
+}
+window.addEventListener('beforeunload', e=>{
+  if(fbCanWrite() && FB_SHARED.some(fbHasLocalChanges)){ fbPersistShared(); e.preventDefault(); e.returnValue=''; }
+});
+
+/* Helper untuk Admin (console): paksa simpan semua perubahan sekarang. */
 window.syncKnowledgeHubToFirestore = async function(){
-  if(!FB_DB) throw new Error('Firebase belum siap.');
-  const batch=FB_DB.batch();
-  const maps={knowledge:DB.knowledge||[],questions:DB.questions||[],quizzes:DB.quizzes||[],products:DB.products||[],notifications:DB.notifications||[]};
-  Object.entries(maps).forEach(([collection,items])=>items.slice(0,500).forEach(item=>{
-    const id=String(item.id||uid('FB'));
-    batch.set(FB_DB.collection(collection).doc(id),{...item, syncedAt:firebase.firestore.FieldValue.serverTimestamp()},{merge:true});
-  }));
-  await batch.commit();
-  showToast('Master data berhasil disinkronkan ke Firestore','success');
+  if(!fbCanWrite()) throw new Error('Hanya super_admin/trainer yang login via Firebase yang dapat menyimpan data.');
+  await fbPersistShared();
+  showToast('Data berhasil disinkronkan ke Firestore','success');
 };
 
 /* Firebase status is available in the browser console for verification. */
